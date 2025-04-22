@@ -1,11 +1,14 @@
 test: test.o
 	ld test.o -o test
 
-test.o: test.asm
-	as test.asm -o test.o
+test.o: test.s
+	as test.s -o test.o
 
-test.asm: mgbfc.go test.bf
-	go run mgbfc.go
+test.s: mgbfc test.bf
+	./mgbfc test.bf
+
+mgbfc: mgbfc.go
+	go build mgbfc.go
 
 # BUILD_DIR:=build
 
