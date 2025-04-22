@@ -125,7 +125,7 @@ func main() {
 			}
 			line++
 			col = 0
-		case '\n':
+		case '\n', ' ':
 			// TODO bandaid
 		default:
 			// TODO better formatting
