@@ -8,7 +8,6 @@ import (
 	"strings"
 )
 
-// tokens
 const (
 	Plus       = '+'
 	Minus      = '-'
@@ -69,7 +68,12 @@ func main() {
 		OutPath)
 
 	line := 1
-	col := 0
+	col := -1
+	// TODO expand labels range. now it is between 65 (A) to 90 (Z)
+	var labelChar byte = 64 // A - 1
+	curLabel := -1
+	var labels [25]byte
+
 	reader := bufio.NewReader(src)
 	for {
 		char, _, err := reader.ReadRune()
@@ -100,6 +104,8 @@ func main() {
 		switch char {
 		// TODO maybe substitute dynamical pointer computing with constants computing at compile time
 		// TODO optimize many add/subs/shifts in a row
+		// TODO make comments optional
+		// TODO optimal string formatting
 		case Plus:
 			write("    addb $1, (%r10, %r9, 1) # increment data at array pointer + data pointer\n", out, OutPath)
 		case Minus:
@@ -125,9 +131,21 @@ func main() {
 				"    syscall\n",
 				out, OutPath)
 		case CycleStart:
-			// TODO
+			// TODO brackets balancing
+			labelChar++
+			curLabel++
+			labels[curLabel] = labelChar
+			// s stands for a start
+			write("\ns"+string(labelChar)+":\n"+
+				"    cmpb $0, (%r10, %r9, 1)"+
+				"\n    je "+"e"+string(labelChar)+
+				" # if byte at data pointer is zero - jump out of cycle\n", out, OutPath)
 		case CycleEnd:
-			// TODO
+			// e stands for an end
+			write("    cmpb $0, (%r10, %r9, 1)\n    jg "+"s"+string(labels[curLabel])+
+				" # if byte at data pointer is nonzero - jump to start of cycle\n"+
+				"\ne"+string(labels[curLabel])+":\n", out, OutPath)
+			curLabel--
 		case Commentary:
 			// TODO better skipping
 			_, err := reader.ReadString('\n')
@@ -137,7 +155,7 @@ func main() {
 			line++
 			col = 0
 		case '\n', ' ':
-			// TODO bandaid
+			// TODO it's a bandaid
 		default:
 			// TODO better formatting
 			panic(SrcPath + ":" + strconv.Itoa(line) + ":" + strconv.Itoa(col) + " ERROR: Unexcepted token: " + string(char)) // TODO string(rune)
