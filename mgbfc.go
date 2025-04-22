@@ -54,14 +54,17 @@ func main() {
 	// TODO maybe input init size of main array
 	// TODO deal with multiline strings
 	// TODO deal with codestyle
+	// TODO don't allocate input_buffer if not necessary
 	write(".section .bss\n"+
-		".lcomm cells, 30720         # allocating main array\n\n"+
+		".lcomm cells, 30720         # allocating main array\n"+
+		".lcomm input_buffer, 1      # allocating input buffer\n\n"+
 		".section .text\n"+
 		".global _start\n\n"+
 		"_start:\n"+
-		"    xor %r9, %r9            # init reg as zero\n"+
-		"    xor %r10, %r10          # init reg as zero\n"+
-		"    lea cells(%rip), %r10   # array ptr into rsi\n\n",
+		"    xor %r9, %r9                 # init reg as zero\n"+
+		"    xor %r10, %r10               # init reg as zero\n"+
+		"    lea cells(%rip), %r10        # put array ptr into r10\n"+
+		"    xor %rsi, %rsi               # init rsi\n\n",
 		out,
 		OutPath)
 
@@ -93,6 +96,7 @@ func main() {
 
 		// r9 for data pointer
 		// r10 for main array pointer
+		// r11 as intermediate reg
 		switch char {
 		// TODO maybe substitute dynamical pointer computing with constants computing at compile time
 		// TODO optimize many add/subs/shifts in a row
@@ -105,7 +109,14 @@ func main() {
 		case LShift:
 			write("    sub $1, %r9w            # decrement data pointer\n", out, OutPath)
 		case Input:
-			// TODO
+			write("\n    mov $0, %rax # sys_read syscall\n"+
+				"    mov $0, %rdi # stdin file descriptor\n"+
+				"    mov $1, %rdx # read 1 byte\n"+
+				"    lea input_buffer(%rip), %rsi # put buffer ptr into rsi\n"+
+				"    syscall\n"+
+				"    movb (%rsi), %r11b # mov input to intermediate reg\n"+
+				"    movb %r11b, (%r10, %r9, 1) # to main array\n",
+				out, OutPath)
 		case Output:
 			write("\n    mov $1, %rax # sys_write syscall\n"+
 				"    mov $1, %rdi # stdout file descriptor\n"+
