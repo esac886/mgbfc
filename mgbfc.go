@@ -8,11 +8,14 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 )
 
 const (
 	rodata = `.section .rodata
-.set tape_size, %d`
+.set tape_size, %d
+`
 
 	bss = `.section .bss
 .lcomm tape, tape_size
@@ -26,11 +29,13 @@ _start:
     xor     %r9,            %r9
     xor     %r10,           %r10
     lea     tape(%rip),     %r10
-    xor     %rsi,           %rsi`
+    xor     %rsi,           %rsi
+`
 
 	epilogue = `    mov     $60,            %rax
     xor     %rbx,           %rbx
-    syscall`
+    syscall
+`
 
 	input = `    mov     $0,              %rax
     mov     $0,              %rdi
@@ -38,23 +43,27 @@ _start:
     lea     in_buf(%rip),    %rsi
     syscall
     movb    (%rsi),          %r11b
-    movb    %r11b,           (%r10, %r9, 1)`
+    movb    %r11b,           (%r10, %r9, 1)
+`
 
 	output = `    mov     $1,             %rax
     mov     $1,             %rdi
     lea     (%r10, %r9, 1), %rsi
     mov     $1,             %rdx
-    syscall`
+    syscall
+`
 
 	cycleStart = `
-%c:
+s%d:
     cmpb    $0,             (%%r10, %%r9, 1)
-    je      e%c`
+    je      e%d
+`
 
 	cycleEnd = `    cmpb    $0,             (%%r10, %%r9, 1)
-    jg      s%c
+    jg      s%d
 
-e%c:`
+e%d:
+`
 
 	increment       = "    addb    $1,             (%r10, %r9, 1)\n"
 	decrement       = "    subb    $1,             (%r10, %r9, 1)\n"
@@ -111,19 +120,30 @@ func main() {
 		}() // TODO what is this brackets
 
 		if outPath == "" || len(sourceFiles) > 1 {
-			// TODO check if .bf extension is present in input source file
-			// cut of .bf extension
-			outPath = srcPath[:len(srcPath)-3]
+			ex, err := os.Executable()
+			if err != nil {
+				logger.Fatalf("ERROR: unable to get path name for the compiler executable")
+			}
+
+			// outPath = current working dir for compiler + name of .bf file without .bf extension
+			if !strings.Contains(srcPath, ".bf") {
+				// TODO abort only
+				logger.Printf("ERROR: provided file %s does not have .bf extension. Ignoring this file. Please provide source code files only with .bf extension", srcPath)
+				continue
+			}
+
+			baseSrc := filepath.Base(srcPath)
+			outPath = filepath.Dir(ex) + "/" + baseSrc[:len(baseSrc)-3]
 		}
 
 		// TODO maybe a better filename generation
 		tmpAsm, err := os.CreateTemp("", "mgbfc-*.s") // "" = system temp dir
 		if err != nil {
-			logger.Fatal("ERROR: unable to create the temporary assembly file ", outPath, ".\n")
+			logger.Fatal("ERROR: unable to create the temporary assembly file ", tmpAsm.Name(), ".\n")
 		}
 		defer func() {
 			if err := os.Remove(tmpAsm.Name()); err != nil {
-				logger.Fatal("ERROR: unable to remove the temporary assembly file ", outPath, ".\n")
+				logger.Fatal("ERROR: unable to remove the temporary assembly file ", tmpAsm.Name(), ".\n")
 			}
 		}()
 		// TODO why did it compile without error handling
@@ -135,14 +155,15 @@ func main() {
 		write(bss, tmpAsm)
 		write(text, tmpAsm)
 
-		// TODO expand labels range. now it is between 65 (A) to 90 (Z)
-		curLabel := -1
-		var labelChar byte = 64 // A - 1
-		var labels [25]byte
 		var dataPtr uint = 0
 
+		// location
 		line := 1
 		col := 0
+
+		labelIdx := -1
+		label := -1
+		labels := make([]uint, 25)
 
 		// reading the bf code file and generating the asm
 		reader := bufio.NewReader(srcFile)
@@ -198,13 +219,13 @@ func main() {
 				write(output, tmpAsm)
 			case '[':
 				// TODO brackets check
-				labelChar++
-				curLabel++
-				labels[curLabel] = labelChar
-				write(fmt.Sprintf(cycleStart, labelChar, labelChar), tmpAsm)
+				label++
+				labelIdx++
+				labels[labelIdx] = uint(label)
+				write(fmt.Sprintf(cycleStart, label, label), tmpAsm)
 			case ']':
-				write(fmt.Sprintf(cycleEnd, labels[curLabel], labels[curLabel]), tmpAsm)
-				curLabel--
+				write(fmt.Sprintf(cycleEnd, labels[labelIdx], labels[labelIdx]), tmpAsm)
+				labelIdx--
 			case '#':
 				// TODO better skipping
 				_, err := reader.ReadString('\n')
@@ -220,8 +241,13 @@ func main() {
 			}
 		}
 
+		tmpAsmPath := tmpAsm.Name()
+		if err := tmpAsm.Close(); err != nil {
+			logger.Fatal("ERROR: unable to close the temporary assembly file ", tmpAsmPath, ".\n")
+		}
+
+		// generating tmp object file
 		if !genAsm {
-			tmpAsmPath := tmpAsm.Name()
 			tmpFilePath := tmpAsmPath[:len(tmpAsmPath)-2]
 			tmpObjPath := tmpFilePath + ".o"
 
@@ -245,9 +271,12 @@ func main() {
 				logger.Fatal("ERROR: failed to generate object file with as. ", err.Error(), ".\n")
 			}
 
+			// TODO verbose
 			if !genObject {
 				// generating the executable from the generated object file
+
 				// TODO maybe get rid of ld somehow
+				// I can generate ELF64 header by myself https://tuket.github.io/notes/asm/elf64_hello_world
 				ld := exec.Command("ld", tmpObjPath, "-o", outPath)
 				if verbose {
 					logger.Print("ld ", tmpObjPath, " -o ", outPath)
@@ -260,6 +289,8 @@ func main() {
 					logger.Fatal("ERROR: failed to generate executable file with ld. ", err.Error(), ".\n")
 				}
 			} else {
+				// generating output object file
+
 				outObj, err := os.Create(outPath + ".o")
 				if err != nil {
 					// TODO if file creating was failed, does Name() method returns valid name??
@@ -291,6 +322,8 @@ func main() {
 				}
 			}
 		} else {
+			// generating out assembly file
+
 			// TODO not working creating empty file
 			outAsm, err := os.Create(outPath + ".s")
 			if verbose {
@@ -310,13 +343,18 @@ func main() {
 				}
 			}()
 
-			if verbose {
-				logger.Printf("Syncing '%s'.\n", tmpAsm.Name())
-			}
-			err = tmpAsm.Sync()
+			tmpAsm, err := os.Open(tmpAsmPath)
 			if err != nil {
-				logger.Fatalf("ERROR: failed to sync '%s'. %s.\n", tmpAsm.Name(), err.Error())
+				logger.Fatalf("ERROR: failed to open %s. %s.\n", tmpAsmPath, err.Error())
 			}
+			defer func() {
+				if verbose {
+					logger.Printf("Closing '%s'.\n", tmpAsm.Name())
+				}
+				if err := tmpAsm.Close(); err != nil {
+					logger.Fatalf("ERROR: failed to close file %s. %s.\n", tmpAsm.Name(), err.Error())
+				}
+			}()
 
 			if verbose {
 				logger.Printf("Copying '%s' to '%s'.\n", tmpAsm.Name(), outAsm.Name())
