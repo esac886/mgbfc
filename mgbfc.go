@@ -71,9 +71,13 @@ e%d:
 	decrDataPtr     = "    sub     $1,             %r9w\n"
 	resetDataPtr    = "    mov     $0,             %r9w\n"
 	maximizeDataPtr = "    mov     $tape_size,     %r9w\n"
+
+	tapeSizeMax     = 4_294_967_296 // 4 GiB
+	tapeSizeDefault = 30720
 )
 
 var logger = log.New(os.Stderr, "", 0)
+var verbose bool
 
 func main() {
 	// flags
@@ -86,49 +90,45 @@ func main() {
 	flag.StringVar(&outPath, "o", "", "Specify name of the output executable (source code file name without .bf extension by default).\n"+
 		"If more than one source code file is provided, then this flag will be ignored, and output executables will have the default name.")
 
-	var genAsm, genObject, verbose bool
-	flag.BoolVar(&verbose, "v", false, "Enable verbose output (such as executed commands and etc).")
+	var genAsm, genObject bool
+	flag.BoolVar(&verbose, "v", false, "Enable verbose output.")
 	flag.BoolVar(&genAsm, "S", false, "Generate .s file with GNU assembly translation of provided .bf source code.")
 	flag.BoolVar(&genObject, "c", false, "Generate .o file with GNU assembly translation of provided .bf source code.")
 
-	// TODO tapeSize limitation
-	// TODO maybe uint32
 	var tapeSize uint
-	flag.UintVar(&tapeSize, "s", 30*1024, "Defines the size of a tape of Turing machine in Kb.")
+	flag.UintVar(&tapeSize, "s", tapeSizeDefault, "Defines the size of a tape of Turing machine in Kb. Must be above zero.")
 
 	flag.Parse()
+
+	if tapeSize == 1 {
+		logger.Println("INFO: provided tape size is below one. The value of the tape size will be assigned to one.")
+		tapeSize = 1
+	} else if tapeSize > tapeSizeMax {
+		logger.Println("INFO: provided tape size is bigger than the maximum value (4 GiB). The value of the tape size will be substracted to maximum.")
+		tapeSize = tapeSizeMax
+	}
 
 	// processing source code files
 	sourceFiles := flag.Args()
 	if len(sourceFiles) == 0 {
-		// TODO better usage
 		fmt.Println("Nothing to do. Try 'mgbfc -h'")
 		return
 	}
 
 	for _, srcPath := range sourceFiles {
-		// TODO maybe shorten the open/close file parts
-		srcFile, err := os.Open(srcPath)
-		if err != nil {
-			// TODO better error handling
-			logger.Fatalf("ERROR: unable to read the source code file %s. %s.\n", srcPath, err.Error())
-		}
-		defer func() {
-			if err := srcFile.Close(); err != nil {
-				logger.Fatalf("ERROR: unable to close the source code file %s. %s.\n", srcPath, err.Error())
-			}
-		}() // TODO what is this brackets
+		srcFile := openFile(srcPath)
+		defer closeFile(srcFile)
 
+		// generating out file name if not provided, or if source files more than one
 		if outPath == "" || len(sourceFiles) > 1 {
 			ex, err := os.Executable()
 			if err != nil {
-				logger.Fatalf("ERROR: unable to get path name for the compiler executable")
+				logger.Fatalln("ERROR: unable to get path name for the compiler executable")
 			}
 
 			// outPath = current working dir for compiler + name of .bf file without .bf extension
 			if !strings.Contains(srcPath, ".bf") {
-				// TODO abort only
-				logger.Printf("ERROR: provided file %s does not have .bf extension. Ignoring this file. Please provide source code files only with .bf extension", srcPath)
+				logger.Printf("ERROR: provided file %s does not have .bf extension. Ignoring this file. Please provide source code files only with .bf extension\n", srcPath)
 				continue
 			}
 
@@ -136,24 +136,20 @@ func main() {
 			outPath = filepath.Dir(ex) + "/" + baseSrc[:len(baseSrc)-3]
 		}
 
-		// TODO maybe a better filename generation
-		tmpAsm, err := os.CreateTemp("", "mgbfc-*.s") // "" = system temp dir
+		tmpAsm, err := os.CreateTemp("", "mgbfc-*.s")
 		if err != nil {
-			logger.Fatal("ERROR: unable to create the temporary assembly file ", tmpAsm.Name(), ".\n")
+			logger.Fatalf("ERROR: unable to create the temporary assembly file %s.\n", tmpAsm.Name())
 		}
-		defer func() {
-			if err := os.Remove(tmpAsm.Name()); err != nil {
-				logger.Fatal("ERROR: unable to remove the temporary assembly file ", tmpAsm.Name(), ".\n")
-			}
-		}()
-		// TODO why did it compile without error handling
-		//defer os.Remove(tmpAsm.Name()) // clean up file afterwards
+		defer removeFile(tmpAsm.Name())
 
-		// generating prologue
+		// TODO why did it compile without error handling
+		// defer os.Remove(tmpAsm.Name()) // clean up file afterwards
+
+		//generating prologue
 		// TODO struct method to get rid of name and path in every func call
-		write(fmt.Sprintf(rodata, tapeSize), tmpAsm)
-		write(bss, tmpAsm)
-		write(text, tmpAsm)
+		writeFile(fmt.Sprintf(rodata, tapeSize), tmpAsm)
+		writeFile(bss, tmpAsm)
+		writeFile(text, tmpAsm)
 
 		var dataPtr uint = 0
 
@@ -172,7 +168,7 @@ func main() {
 			if err != nil {
 				if err == io.EOF {
 					// TODO verbose output
-					write(epilogue, tmpAsm)
+					writeFile(epilogue, tmpAsm)
 					break
 				} else {
 					logger.Fatalf("%s:%d:%d ERROR: %s\n", srcPath, line, col, err.Error())
@@ -194,37 +190,37 @@ func main() {
 			// TODO optimize many add/subs/shifts in a row
 			// TODO optimal string formatting
 			case '+':
-				write("    addb    $1,             (%r10, %r9, 1)\n", tmpAsm)
+				writeFile("    addb    $1,             (%r10, %r9, 1)\n", tmpAsm)
 			case '-':
-				write("    subb    $1,             (%r10, %r9, 1)\n", tmpAsm)
+				writeFile("    subb    $1,             (%r10, %r9, 1)\n", tmpAsm)
 			case '>':
 				if dataPtr == (tapeSize - 1) {
 					dataPtr = 0
-					write("    mov     $0,             %r9w\n", tmpAsm)
+					writeFile("    mov     $0,             %r9w\n", tmpAsm)
 				} else {
 					dataPtr++
-					write("    add     $1,             %r9w\n", tmpAsm)
+					writeFile("    add     $1,             %r9w\n", tmpAsm)
 				}
 			case '<':
 				if dataPtr == 0 {
 					dataPtr = tapeSize - 1
-					write("    mov     $tape_size,     %r9w\n", tmpAsm)
+					writeFile("    mov     $tape_size,     %r9w\n", tmpAsm)
 				} else {
 					dataPtr--
-					write("    sub     $1,             %r9w\n", tmpAsm)
+					writeFile("    sub     $1,             %r9w\n", tmpAsm)
 				}
 			case ',':
-				write(input, tmpAsm)
+				writeFile(input, tmpAsm)
 			case '.':
-				write(output, tmpAsm)
+				writeFile(output, tmpAsm)
 			case '[':
 				// TODO brackets check
 				label++
 				labelIdx++
 				labels[labelIdx] = uint(label)
-				write(fmt.Sprintf(cycleStart, label, label), tmpAsm)
+				writeFile(fmt.Sprintf(cycleStart, label, label), tmpAsm)
 			case ']':
-				write(fmt.Sprintf(cycleEnd, labels[labelIdx], labels[labelIdx]), tmpAsm)
+				writeFile(fmt.Sprintf(cycleEnd, labels[labelIdx], labels[labelIdx]), tmpAsm)
 				labelIdx--
 			case '#':
 				// TODO better skipping
@@ -241,10 +237,9 @@ func main() {
 			}
 		}
 
+		// closing tmp assembly file before generating output file
 		tmpAsmPath := tmpAsm.Name()
-		if err := tmpAsm.Close(); err != nil {
-			logger.Fatal("ERROR: unable to close the temporary assembly file ", tmpAsmPath, ".\n")
-		}
+		closeFile(tmpAsm)
 
 		// generating tmp object file
 		if !genAsm {
@@ -253,132 +248,105 @@ func main() {
 
 			// generating the object file from the generated asm
 			// TODO maybe add fasm
-			as := exec.Command("as", tmpAsmPath, "-o", tmpObjPath)
-			if verbose {
-				logger.Print("as ", tmpAsmPath, " -o ", tmpObjPath)
-			}
-			as.Stdout = os.Stdout
-			as.Stderr = os.Stderr
-			// remove tmp object file after all
-			defer func() {
-				if err := os.Remove(tmpObjPath); err != nil {
-					logger.Fatal("ERROR: failed to remove temporary object file ", tmpObjPath, ". ", err.Error(), ".\n")
-				}
-			}()
+			executeCommand("as", tmpAsmPath, "-o", tmpObjPath)
+			defer removeFile(tmpObjPath)
 
-			err = as.Run()
-			if err != nil {
-				logger.Fatal("ERROR: failed to generate object file with as. ", err.Error(), ".\n")
-			}
-
-			// TODO verbose
 			if !genObject {
 				// generating the executable from the generated object file
-
-				// TODO maybe get rid of ld somehow
-				// I can generate ELF64 header by myself https://tuket.github.io/notes/asm/elf64_hello_world
-				ld := exec.Command("ld", tmpObjPath, "-o", outPath)
-				if verbose {
-					logger.Print("ld ", tmpObjPath, " -o ", outPath)
-				}
-				ld.Stdout = os.Stdout
-				ld.Stderr = os.Stderr
-
-				err = ld.Run()
-				if err != nil {
-					logger.Fatal("ERROR: failed to generate executable file with ld. ", err.Error(), ".\n")
-				}
+				// TODO I can generate ELF64 header by myself https://tuket.github.io/notes/asm/elf64_hello_world
+				executeCommand("ld", tmpObjPath, "-o", outPath)
 			} else {
 				// generating output object file
+				outObj := createFile(outPath + ".o")
+				defer closeFile(outObj)
 
-				outObj, err := os.Create(outPath + ".o")
-				if err != nil {
-					// TODO if file creating was failed, does Name() method returns valid name??
-					logger.Fatalf("ERROR: failed to create file %s. %s.\n", outObj.Name(), err.Error())
-				}
-				defer func() {
-					if err := outObj.Close(); err != nil {
-						logger.Fatalf("ERROR: failed to close file %s. %s.\n", outObj.Name(), err.Error())
-					}
-				}()
+				tmpObj := openFile(tmpObjPath)
+				defer closeFile(tmpObj)
 
-				tmpObj, err := os.Open(tmpObjPath)
-				if err != nil {
-					logger.Fatalf("ERROR: failed to open %s. %s.\n", tmpObjPath, err.Error())
-				}
-				defer func() {
-					if err := tmpObj.Close(); err != nil {
-						logger.Fatalf("ERROR: failed to close file %s. %s.\n", outObj.Name(), err.Error())
-					}
-				}()
-
-				_, err = io.Copy(outObj, tmpObj)
-				if err != nil {
-					logger.Fatalf("ERROR: failed to %s contents to %s.\n", tmpObjPath, outObj.Name())
-				}
-				err = outObj.Sync()
-				if err != nil {
-					logger.Fatalf("ERROR: failed to sync %s. %s.\n", outObj.Name(), err.Error())
-				}
+				copy(outObj, tmpObj)
 			}
 		} else {
 			// generating out assembly file
+			outAsm := createFile(outPath + ".s")
+			defer closeFile(outAsm)
 
-			// TODO not working creating empty file
-			outAsm, err := os.Create(outPath + ".s")
-			if verbose {
-				logger.Printf("Creating '%s'.\n", outAsm.Name())
-			}
+			tmpAsm := openFile(tmpAsmPath)
+			defer closeFile(tmpAsm)
 
-			if err != nil {
-				// TODO if file creating was failed, does Name() method returns valid name??
-				logger.Fatalf("ERROR: failed to create file %s. %s.\n", outAsm.Name(), err.Error())
-			}
-			defer func() {
-				if verbose {
-					logger.Printf("Closing '%s'.\n", outAsm.Name())
-				}
-				if err := outAsm.Close(); err != nil {
-					logger.Fatalf("ERROR: failed to close file '%s'. %s.\n", outAsm.Name(), err.Error())
-				}
-			}()
-
-			tmpAsm, err := os.Open(tmpAsmPath)
-			if err != nil {
-				logger.Fatalf("ERROR: failed to open %s. %s.\n", tmpAsmPath, err.Error())
-			}
-			defer func() {
-				if verbose {
-					logger.Printf("Closing '%s'.\n", tmpAsm.Name())
-				}
-				if err := tmpAsm.Close(); err != nil {
-					logger.Fatalf("ERROR: failed to close file %s. %s.\n", tmpAsm.Name(), err.Error())
-				}
-			}()
-
-			if verbose {
-				logger.Printf("Copying '%s' to '%s'.\n", tmpAsm.Name(), outAsm.Name())
-			}
-			_, err = io.Copy(outAsm, tmpAsm)
-			if err != nil {
-				logger.Fatalf("ERROR: failed to copy '%s' contents to '%s'.\n", tmpAsm.Name(), outAsm.Name())
-			}
-
-			if verbose {
-				logger.Printf("Syncing '%s'.\n", outAsm.Name())
-			}
-			err = outAsm.Sync()
-			if err != nil {
-				logger.Fatalf("ERROR: failed to sync '%s'. '%s'.\n", outAsm.Name(), err.Error())
-			}
+			copy(outAsm, tmpAsm)
 		}
 	}
 }
 
-// TODO move file operations in func
-// TODO maybe file.Sync() after all writings
-func write(payload string, file *os.File) {
-	if _, err := file.WriteString(payload); err != nil {
-		logger.Fatal("ERROR: Unable to write to the file ", file.Name(), ". ", err.Error(), "\n")
+func createFile(path string) *os.File {
+	if verbose {
+		logger.Printf("Creating '%s'\n", path)
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		// TODO if file creating was failed, does Name() method returns valid??
+		logger.Fatalf("ERROR: failed to create file '%s'. %s.\n", file.Name(), err.Error())
+	}
+	return file
+}
+
+func writeFile(payload string, file *os.File) {
+	_, err := file.WriteString(payload)
+	if err != nil {
+		logger.Fatalf("ERROR: Unable to write to the file '%s'. %s\n", file.Name(), err.Error())
+	}
+}
+
+func openFile(path string) *os.File {
+	if verbose {
+		logger.Printf("Opening '%s'\n", path)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		logger.Fatalf("ERROR: unable to read the file '%s'. %s.\n", path, err.Error())
+	}
+	return file
+}
+
+func closeFile(file *os.File) {
+	if verbose {
+		logger.Printf("Closing '%s'\n", file.Name())
+	}
+	if err := file.Close(); err != nil {
+		logger.Fatalf("ERROR: unable to close the file '%s'. %s.\n", file.Name(), err.Error())
+	}
+}
+
+func removeFile(path string) {
+	if verbose {
+		logger.Printf("Removing '%s'\n", path)
+	}
+	if err := os.Remove(path); err != nil {
+		logger.Fatalf("ERROR: unable to remove the file '%s'. %s\n", path, err.Error())
+	}
+}
+
+func copy(target *os.File, source *os.File) {
+	if verbose {
+		logger.Printf("Copying '%s' to '%s'\n", target.Name(), source.Name())
+	}
+	_, err := io.Copy(target, source)
+	if err != nil {
+		logger.Fatalf("ERROR: failed to copy '%s' contents to '%s'. %s\n", source.Name(), target.Name(), err.Error())
+	}
+}
+
+func executeCommand(name string, args ...string) {
+	if verbose {
+		logger.Printf("Executing '%s %s'\n", name, strings.Join(args, " "))
+	}
+
+	cmd := exec.Command(name, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	err := cmd.Run()
+	if err != nil {
+		logger.Fatalf("ERROR: failed to generate object file with as. %s\n", err.Error())
 	}
 }
