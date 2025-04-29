@@ -146,7 +146,6 @@ func main() {
 		// defer os.Remove(tmpAsm.Name()) // clean up file afterwards
 
 		//generating prologue
-		// TODO struct method to get rid of name and path in every func call
 		writeFile(fmt.Sprintf(rodata, tapeSize), tmpAsm)
 		writeFile(bss, tmpAsm)
 		writeFile(text, tmpAsm)
@@ -173,14 +172,6 @@ func main() {
 				} else {
 					logger.Fatalf("%s:%d:%d ERROR: %s\n", srcPath, line, col, err.Error())
 				}
-			}
-
-			// saving location
-			if char == '\n' {
-				line++
-				col = 1
-			} else {
-				col++
 			}
 
 			// r9 for data pointer
@@ -228,13 +219,16 @@ func main() {
 				if err != nil {
 					panic(err)
 				}
+				fallthrough
+			case '\n':
 				line++
 				col = 0
-			case '\n', ' ':
-				// TODO it's a bandaid
+			case ' ':
 			default:
-				logger.Fatalf("%s:%d:%d ERROR: Unexcepted token: %c\n", srcPath, line, col, char)
+				logger.Fatalf("%s:%d:%d: ERROR: Unexcepted token: %c\n", srcPath, line, col, char)
 			}
+
+			col++
 		}
 
 		// closing tmp assembly file before generating output file
