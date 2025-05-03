@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -65,16 +66,26 @@ s%d:
 e%d:
 `
 
-	increment       = "    addb    $1,             (%r10, %r9, 1)\n"
-	decrement       = "    subb    $1,             (%r10, %r9, 1)\n"
-	incrDataPtr     = "    add     $1,             %r9w\n"
-	decrDataPtr     = "    sub     $1,             %r9w\n"
-	resetDataPtr    = "    mov     $0,             %r9w\n"
-	maximizeDataPtr = "    mov     $tape_size,     %r9w\n"
+	increment       = "    addb    $%d,             (%%r10, %%r9, 1)\n"
+	decrement       = "    subb    $%d,             (%%r10, %%r9, 1)\n"
+	incrDataPtr     = "    add     $%d,             %%r9w\n"
+	decrDataPtr     = "    sub     $%d,             %%r9w\n"
+	resetDataPtr    = "    mov     $0,             %%r9w\n"
+	maximizeDataPtr = "    mov     $tape_size,     %%r9w\n"
 
 	tapeSizeMax     = 4_294_967_296 // 4 GiB
 	tapeSizeDefault = 30720
 )
+
+type labelsMetadata struct {
+	label, labelIdx int
+	labels          []uint
+}
+
+type instructionSeq struct {
+	instruction   rune
+	numInSequence uint
+}
 
 var logger = log.New(os.Stderr, "", 0)
 var verbose bool
@@ -120,19 +131,19 @@ func main() {
 		logv("Opening '%s'\n", srcPath)
 		srcFile, err := os.Open(srcPath)
 		if err != nil {
-			logger.Fatalf("ERROR: unable to read the file '%s'. %s\n", srcPath, err.Error())
+			logger.Fatalf("%s: error: unable to read file. %s\n", srcPath, err.Error())
 		}
 
 		// generating out file name if not provided, or if source files more than one
 		if outPath == "" || len(sourceFiles) > 1 {
 			ex, err := os.Executable()
 			if err != nil {
-				logger.Fatalln("ERROR: unable to get path name for the compiler executable")
+				logger.Fatalln("error: unable to get path name for the compiler executable")
 			}
 
 			// outPath = current working dir for compiler + name of .bf file without .bf extension
 			if !strings.Contains(srcPath, ".bf") {
-				logger.Printf("%s: ERROR: this file does not have .bf extension. Ignoring this file. Please provide source code files only with .bf extension\n", srcPath)
+				logger.Printf("%s: error: this file does not have .bf extension. Ignoring this file. Please provide source code files only with .bf extension\n", srcPath)
 				continue
 			}
 
@@ -142,7 +153,7 @@ func main() {
 
 		tmpAsm, err := os.CreateTemp("", "mgbfc-*.s")
 		if err != nil {
-			logger.Fatalf("ERROR: unable to create the temporary assembly file \n")
+			logger.Fatalf("error: unable to create the temporary assembly file \n")
 		}
 
 		tmpAsmName := tmpAsm.Name()
@@ -151,7 +162,7 @@ func main() {
 		defer func() {
 			logv("Removing '%s'\n", tmpAsmName)
 			if err := os.Remove(tmpAsmName); err != nil {
-				logger.Printf("WARNING: unable to remove the file '%s'. %s\n", tmpAsmName, err.Error())
+				logger.Printf("%s: warning: unable to remove file. %s\n", tmpAsmName, err.Error())
 			}
 		}()
 
@@ -160,126 +171,75 @@ func main() {
 		// generating prologue
 		_, err = tmpAsm.WriteString(fmt.Sprintf(rodata, tapeSize) + bss + text)
 		if err != nil {
-			logger.Fatalf("ERROR: unable to write to the file '%s'. %s\n", tmpAsmName, err.Error())
+			logger.Fatalf("%s: error: unable to write to file. %s\n", tmpAsmName, err.Error())
 		}
 
-		var dataPtr, line, col uint = 0, 1, 0
+		labelsData := labelsMetadata{label: -1, labelIdx: -1, labels: make([]uint, 25)}
+		sequence := instructionSeq{}
 
-		labelIdx := -1
-		label := -1
-		labels := make([]uint, 25)
-
+		var dataPtr uint = 0
+		var line, col uint = 1, 0
 		var bracketNestinglvl uint = 0
 		var firstBracketLine, firstBracketCol uint
 
 		// reading the bf code file and generating the asm
 		reader := bufio.NewReader(srcFile)
 		for {
-			char, _, err := reader.ReadRune()
+			instruction, _, err := reader.ReadRune()
 			if err != nil {
 				if err == io.EOF {
 					if bracketNestinglvl != 0 {
-						logger.Fatalf("%s:%d:%d: ERROR: unclosed bracket", srcPath, firstBracketLine, firstBracketCol)
+						logger.Fatalf("%s:%d:%d: error: unclosed bracket", srcPath, firstBracketLine, firstBracketCol)
 					}
+
+					// write last instruction sequence
+					writeInstruction(sequence.instruction, tmpAsm, &dataPtr, &labelsData, sequence.numInSequence, tapeSize)
 
 					_, err := tmpAsm.WriteString(epilogue)
 					if err != nil {
-						logger.Fatalf("ERROR: unable to write to '%s'. %s\n", tmpAsmName, err.Error())
+						logger.Fatalf("%s: error: unable to write to file. %s\n", tmpAsm.Name(), err.Error())
 					}
 					break
 				} else {
-					logger.Fatalf("%s:%d:%d: ERROR: unable to read character from '%s'. %s\n", srcPath, line, col, srcFile.Name(), err.Error())
+					logger.Fatalf("%s:%d:%d: error: unable to read character. %s\n", srcFile.Name(), line, col, err.Error())
 				}
 			}
 
-			// r9 for data pointer
-			// r10 for main array pointer
-			// r11 as intermediate reg
-			switch char {
-			// TODO optimize many add/subs/shifts in a row
-			case '+':
-				_, err := tmpAsm.WriteString(increment)
+			if instruction == '#' {
+				_, err := reader.ReadString('\n')
 				if err != nil {
-					logger.Fatalf("ERROR: unable to write to the file '%s'. %s\n", tmpAsmName, err.Error())
+					logger.Fatalf("%s: error: unable to read from this file. %s\n", srcFile.Name(), err.Error())
 				}
-			case '-':
-				_, err := tmpAsm.WriteString(decrement)
-				if err != nil {
-					logger.Fatalf("ERROR: unable to write to the file '%s'. %s\n", tmpAsmName, err.Error())
-				}
-			case '>':
-				if dataPtr == (tapeSize - 1) {
-					dataPtr = 0
-					_, err := tmpAsm.WriteString(resetDataPtr)
-					if err != nil {
-						logger.Fatalf("ERROR: unable to write to the file '%s'. %s\n", tmpAsmName, err.Error())
-					}
-				} else {
-					dataPtr++
-					_, err := tmpAsm.WriteString(incrDataPtr)
-					if err != nil {
-						logger.Fatalf("ERROR: unable to write to the file '%s'. %s\n", tmpAsmName, err.Error())
-					}
-				}
-			case '<':
-				if dataPtr == 0 {
-					dataPtr = tapeSize - 1
-					_, err := tmpAsm.WriteString(maximizeDataPtr)
-					if err != nil {
-						logger.Fatalf("ERROR: unable to write to the file '%s'. %s\n", tmpAsmName, err.Error())
-					}
-				} else {
-					dataPtr--
-					_, err := tmpAsm.WriteString(decrDataPtr)
-					if err != nil {
-						logger.Fatalf("ERROR: unable to write to the file '%s'. %s\n", tmpAsmName, err.Error())
-					}
-				}
-			case ',':
-				_, err := tmpAsm.WriteString(input)
-				if err != nil {
-					logger.Fatalf("ERROR: unable to write to the file '%s'. %s\n", tmpAsmName, err.Error())
-				}
-			case '.':
-				_, err := tmpAsm.WriteString(output)
-				if err != nil {
-					logger.Fatalf("ERROR: unable to write to the file '%s'. %s\n", tmpAsmName, err.Error())
-				}
-			case '[':
+				line++
+				col = 1
+				continue
+			} else if instruction == '\n' {
+				line++
+				col = 1
+				continue
+			}
+
+			// for brackets balance checking
+			if instruction == '[' {
 				if bracketNestinglvl == 0 {
 					firstBracketLine = line
 					firstBracketCol = col
 				}
 				bracketNestinglvl++
-
-				label++
-				labelIdx++
-				labels[labelIdx] = uint(label)
-
-				_, err := tmpAsm.WriteString(fmt.Sprintf(cycleStart, label, label))
-				if err != nil {
-					logger.Fatalf("ERROR: unable to write to the file '%s'. %s\n", tmpAsmName, err.Error())
-				}
-			case ']':
+			} else if instruction == ']' {
 				bracketNestinglvl--
+			}
 
-				_, err := tmpAsm.WriteString(fmt.Sprintf(cycleEnd, labels[labelIdx], labels[labelIdx]))
-				if err != nil {
-					logger.Fatalf("ERROR: unable to write to the file '%s'. %s\n", tmpAsmName, err.Error())
-				}
-				labelIdx--
-			case '#':
-				_, err := reader.ReadString('\n')
-				if err != nil {
-					logger.Fatalf("%d: ERROR: unable to read line from '%s'. %s\n", line, srcFile.Name(), err.Error())
-				}
-				fallthrough
-			case '\n':
-				line++
-				col = 0
-			case ' ':
-			default:
-				logger.Fatalf("%s:%d:%d: ERROR: unexcepted token: '%c'\n", srcFile.Name(), line, col, char)
+			if sequence.instruction == 0 {
+				sequence.instruction = instruction
+				sequence.numInSequence++
+			} else if sequence.instruction == instruction {
+				sequence.numInSequence++
+			} else if sequence.instruction != instruction {
+				writeInstruction(sequence.instruction, tmpAsm, &dataPtr, &labelsData, sequence.numInSequence, tapeSize)
+
+				sequence.instruction = instruction
+				sequence.numInSequence = 1
 			}
 
 			col++
@@ -290,7 +250,7 @@ func main() {
 		// closing tmp assembly file before generating output file
 		logv("Closing '%s'\n", tmpAsmName)
 		if err := tmpAsm.Close(); err != nil {
-			logger.Printf("WARNING: unable to close the file '%s'. %s\n", tmpAsmName, err.Error())
+			logger.Printf("%s: warning: unable to close file. %s\n", tmpAsmName, err.Error())
 		}
 
 		logv("Parsing '%s' and generating assembly completed", srcPath)
@@ -304,7 +264,6 @@ func main() {
 
 		if genObject {
 			tmpObjPath, err := generateTmpObj(tmpAsmName)
-			// TODO if error is occured here, is it safe to defer removing?
 			if err != nil {
 				logger.Fatal(err.Error())
 			}
@@ -312,7 +271,7 @@ func main() {
 			defer func() {
 				logv("Removing '%s'\n", tmpObjPath)
 				if err := os.Remove(tmpObjPath); err != nil {
-					logger.Printf("WARNING: unable to remove the file '%s'. %s\n", tmpObjPath, err.Error())
+					logger.Printf("%s: warning: unable to remove file. %s\n", tmpObjPath, err.Error())
 				}
 			}()
 
@@ -324,7 +283,6 @@ func main() {
 
 		if !genAsm && !genObject {
 			tmpObjPath, err := generateTmpObj(tmpAsmName)
-			// TODO if error is occured here, is it safe to defer removing?
 			if err != nil {
 				logger.Fatal(err.Error())
 			}
@@ -332,7 +290,7 @@ func main() {
 			defer func() {
 				logv("Removing '%s'\n", tmpObjPath)
 				if err := os.Remove(tmpObjPath); err != nil {
-					logger.Printf("WARNING: unable to remove the file '%s'. %s\n", tmpObjPath, err.Error())
+					logger.Printf("%s: warning: unable to remove file. %s\n", tmpObjPath, err.Error())
 				}
 			}()
 
@@ -344,11 +302,100 @@ func main() {
 
 		logv("Closing '%s'\n", srcFile.Name())
 		if err := srcFile.Close(); err != nil {
-			logger.Printf("WARNING: unable to close the file '%s'. %s\n", srcFile.Name(), err.Error())
+			logger.Printf("%s: warning: unable to close file. %s\n", srcFile.Name(), err.Error())
 		}
 
 		logv("Compilation completed\n")
 	}
+}
+
+func writeInstruction(instruction rune, dst *os.File, dataPtr *uint, labelsData *labelsMetadata, sequenceCount uint, tapeSize uint) error {
+	dstName := dst.Name()
+
+	// r9 for data pointer
+	// r10 for main array pointer
+	// r11 as intermediate reg
+	switch instruction {
+	case '+':
+		_, err := dst.WriteString(fmt.Sprintf(increment, sequenceCount))
+		if err != nil {
+			return fmt.Errorf("%s: error: unable to write to file. %s\n", dstName, err.Error())
+		}
+	case '-':
+		_, err := dst.WriteString(fmt.Sprintf(decrement, sequenceCount))
+		if err != nil {
+			return fmt.Errorf("%s: error: unable to write to file. %s\n", dstName, err.Error())
+		}
+	case '>':
+		if *dataPtr == (tapeSize - 1) {
+			*dataPtr = 0
+			_, err := dst.WriteString(resetDataPtr)
+			if err != nil {
+				return fmt.Errorf("%s: error: unable to write to file. %s\n", dstName, err.Error())
+			}
+		} else {
+			*dataPtr++
+			_, err := dst.WriteString(fmt.Sprintf(incrDataPtr, sequenceCount))
+			if err != nil {
+				return fmt.Errorf("%s: error: unable to write to file. %s\n", dstName, err.Error())
+			}
+		}
+	case '<':
+		if *dataPtr == 0 {
+			*dataPtr = tapeSize - 1
+			_, err := dst.WriteString(maximizeDataPtr)
+			if err != nil {
+				return fmt.Errorf("%s: error: unable to write to file. %s\n", dstName, err.Error())
+			}
+		} else {
+			*dataPtr--
+			_, err := dst.WriteString(fmt.Sprintf(decrDataPtr, sequenceCount))
+			if err != nil {
+				return fmt.Errorf("%s: error: unable to write to file. %s\n", dstName, err.Error())
+			}
+		}
+	case ',':
+		_, err := dst.WriteString(input)
+		if err != nil {
+			return fmt.Errorf("%s: error: unable to write to file. %s\n", dstName, err.Error())
+		}
+	case '.':
+		_, err := dst.WriteString(output)
+		if err != nil {
+			return fmt.Errorf("%s: error: unable to write to file. %s\n", dstName, err.Error())
+		}
+	case '[':
+		// TODO optimize unnecessary cycles (like +[[[[[->+.<]]]]] may be optimized to +[->+.<])
+		for i := uint(0); i < sequenceCount; i++ {
+			labelsData.label++
+			labelsData.labelIdx++
+			if len(labelsData.labels) <= labelsData.labelIdx {
+				labelsData.labels = append(labelsData.labels, uint(labelsData.label))
+			} else {
+				labelsData.labels[labelsData.labelIdx] = uint(labelsData.label)
+			}
+
+			_, err := dst.WriteString(fmt.Sprintf(cycleStart, labelsData.label, labelsData.label))
+			if err != nil {
+				return fmt.Errorf("%s: error: unable to write to file. %s\n", dstName, err.Error())
+			}
+		}
+	case ']':
+		for i := uint(0); i < sequenceCount; i++ {
+			_, err := dst.WriteString(fmt.Sprintf(cycleEnd, labelsData.labels[labelsData.labelIdx], labelsData.labels[labelsData.labelIdx]))
+			if err != nil {
+				return fmt.Errorf("%s: error: unable to write to file. %s\n", dstName, err.Error())
+			}
+			labelsData.labelIdx--
+		}
+	default:
+		if instruction != ' ' && instruction != '\n' && instruction != '#' {
+			// TODO how to return location properly
+			return fmt.Errorf("error: unexcepted token: '%c'\n", instruction)
+		}
+	}
+
+	return nil
 }
 
 func generateOutAsm(outPath string, tmpAsmName string) error {
@@ -357,39 +404,39 @@ func generateOutAsm(outPath string, tmpAsmName string) error {
 	logv("Creating '%s'\n", outPath)
 	outAsm, err := os.Create(outPath)
 	if err != nil {
-		return fmt.Errorf("ERROR: failed to create file '%s'. %s\n", outPath, err.Error())
+		return fmt.Errorf("%s: error: failed to create file. %s\n", outPath, err.Error())
 	}
 
 	defer func() {
 		logv("Closing '%s'\n", outAsm.Name())
 		if err := outAsm.Close(); err != nil {
-			logger.Printf("WARNING: unable to close the file '%s'. %s\n", outAsm.Name(), err.Error())
+			logger.Printf("%s: warning: unable to close file. %s\n", outAsm.Name(), err.Error())
 		}
 	}()
 
 	logv("Opening '%s'\n", tmpAsmName)
 	tmpAsm, err := os.Open(tmpAsmName)
 	if err != nil {
-		return fmt.Errorf("ERROR: unable to read the file '%s'. %s\n", tmpAsmName, err.Error())
+		return fmt.Errorf("%s: error: unable to read file. %s\n", tmpAsmName, err.Error())
 	}
 
 	defer func() {
 		logv("Closing '%s'\n", tmpAsmName)
 		if err := tmpAsm.Close(); err != nil {
-			logger.Printf("WARNING: unable to close the file '%s'. %s\n", tmpAsmName, err.Error())
+			logger.Printf("%s: warning: unable to close file. %s\n", tmpAsmName, err.Error())
 		}
 	}()
 
 	logv("Copying '%s' to '%s'.\n", tmpAsmName, outAsm.Name())
 	_, err = io.Copy(outAsm, tmpAsm)
 	if err != nil {
-		return fmt.Errorf("ERROR: failed to copy '%s' contents to '%s'. %s\n", tmpAsmName, outAsm.Name(), err.Error())
+		return fmt.Errorf("error: failed to copy '%s' contents to '%s'. %s\n", tmpAsmName, outAsm.Name(), err.Error())
 	}
 
 	logv("Syncing '%s'\n", outAsm.Name())
 	err = outAsm.Sync()
 	if err != nil {
-		return fmt.Errorf("ERROR: failed to sync '%s'. %s\n", outAsm.Name(), err.Error())
+		return fmt.Errorf("%s: error: failed to sync. %s\n", outAsm.Name(), err.Error())
 	}
 
 	return nil
@@ -407,7 +454,7 @@ func generateTmpObj(tmpAsmName string) (string, error) {
 
 	err := executeCommand(cmdName, cmdArgs...)
 	if err != nil {
-		return "", fmt.Errorf("ERROR: unable to execute '%s %s'. %s\n", cmdName, strings.Join(cmdArgs, " "), err.Error())
+		return "", err
 	}
 
 	return tmpObjPath, nil
@@ -419,33 +466,33 @@ func generateOutObj(outPath string, tmpObjPath string) error {
 	logv("Creating '%s'\n", outPath)
 	outObj, err := os.Create(outPath)
 	if err != nil {
-		return fmt.Errorf("ERROR: unable to create file '%s'. %s\n", outPath, err.Error())
+		return fmt.Errorf("%s: error: unable to create file. %s\n", outPath, err.Error())
 	}
 
 	defer func() {
 		logv("Closing '%s'\n", outObj.Name())
 		if err := outObj.Close(); err != nil {
-			logger.Printf("WARNING: unable to close the file '%s'. %s\n", outObj.Name(), err.Error())
+			logger.Printf("%s: warning: unable to close file. %s\n", outObj.Name(), err.Error())
 		}
 	}()
 
 	logv("Opening '%s'\n", tmpObjPath)
 	tmpObj, err := os.Open(tmpObjPath)
 	if err != nil {
-		return fmt.Errorf("ERROR: unable to open the file '%s'. %s\n", tmpObjPath, err.Error())
+		return fmt.Errorf("%s: error: unable to open file. %s\n", tmpObjPath, err.Error())
 	}
 
 	defer func() {
 		logv("Closing '%s'\n", tmpObj.Name())
 		if err := tmpObj.Close(); err != nil {
-			logger.Printf("WARNING: unable to close the file '%s'. %s\n", tmpObj.Name(), err.Error())
+			logger.Printf("%s: warning: unable to close file. %s\n", tmpObj.Name(), err.Error())
 		}
 	}()
 
 	logv("Copying '%s' to '%s'.\n", tmpObj.Name(), outObj.Name())
 	_, err = io.Copy(outObj, tmpObj)
 	if err != nil {
-		return fmt.Errorf("ERROR: failed to copy '%s' contents to '%s'. %s\n", tmpObj.Name(), outObj.Name(), err.Error())
+		return fmt.Errorf("error: failed to copy '%s' contents to '%s'. %s\n", tmpObj.Name(), outObj.Name(), err.Error())
 	}
 
 	return nil
@@ -458,12 +505,7 @@ func generateOutExe(outPath string, tmpObjPath string) error {
 	cmdName := "ld"
 	cmdArgs := []string{tmpObjPath, "-o", outPath}
 
-	err := executeCommand(cmdName, cmdArgs...)
-	if err != nil {
-		return fmt.Errorf("ERROR: unable to execute '%s %s'. %s\n", cmdName, strings.Join(cmdArgs, " "), err.Error())
-	}
-
-	return nil
+	return executeCommand(cmdName, cmdArgs...)
 }
 
 func logv(format string, args ...any) {
@@ -479,5 +521,16 @@ func executeCommand(name string, args ...string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	return cmd.Run()
+	err := cmd.Run()
+	if err != nil {
+		// if command was executed but returned non-zero code
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return fmt.Errorf("%s: %s\n", name, exitErr.Error())
+		}
+
+		return fmt.Errorf("error: unable to execute '%s %s'. %s\n", name, strings.Join(args, " "), err.Error())
+	}
+
+	return nil
 }
